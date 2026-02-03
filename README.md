@@ -1,24 +1,9 @@
-# REPO NAME 
+# Lakebase Examples
 
-```
-Placeholder
+Examples and guides to accelerate your Lakebase projects. 
 
-Fill here a description at a functional level - what is this content doing
-```
-
-## Video Overview
-
-Include a GIF overview of what your project does. Use a service like Quicktime, Zoom or Loom to create the video, then convert to a GIF.
-
-
-## Installation
-
-Include details on how to use and install this content. 
-
-## How to get help
-
-Databricks support doesn't cover this content. For questions or bugs, please open a GitHub issue and the team will help on a best effort basis.
-
+Official Lakebase announcment blog: https://www.databricks.com/product/lakebase
+Official Documentation: https://docs.databricks.com/aws/en/oltp/
 
 ## License
 
