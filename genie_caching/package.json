@@ -1,0 +1,13 @@
+{
+  "name": "genie-cache-queue",
+  "version": "1.0.0",
+  "description": "Databricks Genie API with intelligent caching and rate limiting",
+  "scripts": {
+    "bundle:validate": "databricks bundle validate -t demo",
+    "bundle:deploy": "databricks bundle deploy -t demo --auto-approve",
+    "bundle:run": "databricks bundle run genie_gateway -t demo"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "MIT"
+}

@@ -1,0 +1,641 @@
+"""
+Gateway CRUD API routes.
+Manages gateway configurations and provides workspace discovery endpoints.
+"""
+
+import logging
+import os
+import uuid
+from datetime import datetime, timezone
+from typing import Optional
+
+import httpx
+from fastapi import APIRouter, HTTPException, Request
+from pydantic import BaseModel
+
+from app.auth import ensure_https
+from app.models import GatewayConfig, GatewayCreateRequest, GatewayUpdateRequest
+from app.api.auth_helpers import extract_bearer_token_optional, resolve_user_token_optional, require_role
+from app.api.config_store import get_effective_setting, get_overrides, update_overrides
+from app.config import get_settings
+from app.version import __version__ as APP_VERSION
+import app.services.database as _db
+
+logger = logging.getLogger(__name__)
+gateway_router = APIRouter()
+settings = get_settings()
+
+_discovery_client = httpx.AsyncClient(timeout=15.0)
+
+
+async def close_discovery_client():
+    """Close the shared HTTP client. Call during app shutdown."""
+    await _discovery_client.aclose()
+
+
+@gateway_router.get("/version")
+async def get_version():
+    """Return the installed app version. Public (no auth)."""
+    return {"version": APP_VERSION}
+
+
+
+def _get_host() -> str:
+    """Get Databricks workspace host with https:// prefix."""
+    host = get_effective_setting("databricks_host") or settings.databricks_host
+    if not host:
+        raise HTTPException(status_code=500, detail="DATABRICKS_HOST not configured")
+    return ensure_https(host)
+
+
+# --- Gateway CRUD ---
+
+@gateway_router.get("/gateways")
+async def list_gateways(req: Request):
+    """List all gateways with stats. Requires authentication."""
+    await require_role(req, "use")
+    try:
+        gateways = await _db.db_service.list_gateways()
+        # Attach stats to each gateway
+        for gw in gateways:
+            try:
+                stats = await _db.db_service.get_gateway_stats(gw["id"])
+                gw["cache_entries"] = stats.get("cache_count", 0)
+                gw["query_count_7d"] = stats.get("query_count_7d", 0)
+            except Exception:
+                gw["cache_entries"] = 0
+                gw["query_count_7d"] = 0
+        return gateways
+    except Exception as e:
+        logger.exception("Error listing gateways")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+def _unset_if_blank(body_value):
+    """Normalize blank strings to None so the DB stores NULL.
+
+    _build_runtime_settings then resolves NULL dynamically against the
+    current global setting (and then the env default). Snapshotting globals
+    at create time would silently pin each gateway to whatever global was
+    set at creation and diverge from runtime behavior after a later global
+    change — the banner promise ("runtime fallback when a gateway leaves a
+    field unset") holds only if we leave it unset here.
+    """
+    if body_value is None or body_value == "":
+        return None
+    return body_value
+
+
+def _build_gateway_config_from_body(body: GatewayCreateRequest, user_email: str | None, now: datetime) -> dict:
+    """Translate a gateway-create request body into the storage-layer dict.
+
+    Extracted so the body → config mapping can be unit-tested without
+    dragging in FastAPI, auth, and the DB layer.
+
+    Semantics:
+    - Numeric / boolean fields that are None in the body → stored as NULL
+      (dynamic resolution at runtime).
+    - Text fields: None or "" → stored as NULL, same reason.
+    - sql_warehouse_id has a NOT NULL constraint (pre-existing), so it falls
+      back to the current global at create time and then to empty string.
+      The empty-string fallback lets RuntimeSettings.sql_warehouse_id's
+      .strip() check resolve to the env default.
+    """
+    sql_warehouse_id = body.sql_warehouse_id or get_effective_setting("sql_warehouse_id") or ""
+    return {
+        "id": str(uuid.uuid4()),
+        "name": body.name,
+        "genie_space_id": body.genie_space_id,
+        "sql_warehouse_id": sql_warehouse_id,
+        "similarity_threshold": body.similarity_threshold,
+        "max_queries_per_minute": body.max_queries_per_minute,
+        "cache_ttl_hours": body.cache_ttl_hours,
+        "question_normalization_enabled": body.question_normalization_enabled,
+        "cache_validation_enabled": body.cache_validation_enabled,
+        "caching_enabled": body.caching_enabled,
+        "embedding_provider": _unset_if_blank(body.embedding_provider),
+        "databricks_embedding_endpoint": _unset_if_blank(body.databricks_embedding_endpoint),
+        "shared_cache": body.shared_cache,
+        "normalization_model": _unset_if_blank(body.normalization_model),
+        "validation_model": _unset_if_blank(body.validation_model),
+        "intent_split_model": _unset_if_blank(body.intent_split_model),
+        "intent_split_enabled": body.intent_split_enabled,
+        "status": "active",
+        "created_by": user_email,
+        "description": body.description or "",
+        "created_at": now,
+        "updated_at": now,
+    }
+
+
+@gateway_router.post("/gateways", status_code=201)
+async def create_gateway(body: GatewayCreateRequest, req: Request):
+    """Create a new gateway configuration. Owner only."""
+    await require_role(req, "owner")
+    try:
+        now = datetime.now(timezone.utc)
+        user_email = req.headers.get("X-Forwarded-Email")
+
+        # Validate unique name
+        existing = await _db.db_service.list_gateways()
+        if any(g["name"].lower() == body.name.lower() for g in existing):
+            raise HTTPException(status_code=409, detail=f"A gateway named '{body.name}' already exists.")
+
+        config = _build_gateway_config_from_body(body, user_email, now)
+
+        result = await _db.db_service.create_gateway(config)
+        logger.info("Gateway created: id=%s name=%s by=%s", config["id"], config["name"], user_email)
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Error creating gateway")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@gateway_router.get("/gateways/{gateway_id}")
+async def get_gateway(gateway_id: str, req: Request):
+    """Get a single gateway with stats. Requires authentication."""
+    await require_role(req, "use")
+    try:
+        gw = await _db.db_service.get_gateway(gateway_id)
+        if not gw:
+            raise HTTPException(status_code=404, detail="Gateway not found")
+
+        try:
+            stats = await _db.db_service.get_gateway_stats(gateway_id)
+            gw["cache_entries"] = stats.get("cache_count", 0)
+            gw["query_count_7d"] = stats.get("query_count_7d", 0)
+        except Exception:
+            gw["cache_entries"] = 0
+            gw["query_count_7d"] = 0
+
+        return gw
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Error getting gateway")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@gateway_router.put("/gateways/{gateway_id}")
+async def update_gateway(gateway_id: str, body: GatewayUpdateRequest, req: Request):
+    """Update gateway fields. Manage or above."""
+    await require_role(req, "manage")
+    try:
+        updates = body.model_dump(exclude_none=True)
+        if not updates:
+            raise HTTPException(status_code=400, detail="No fields to update")
+
+        result = await _db.db_service.update_gateway(gateway_id, updates)
+        if not result:
+            raise HTTPException(status_code=404, detail="Gateway not found")
+
+        logger.info("Gateway updated: id=%s fields=%s", gateway_id, list(updates.keys()))
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Error updating gateway")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@gateway_router.delete("/gateways/{gateway_id}")
+async def delete_gateway(gateway_id: str, req: Request):
+    """Delete a gateway. Owner only."""
+    await require_role(req, "owner")
+    try:
+        deleted = await _db.db_service.delete_gateway(gateway_id)
+        if not deleted:
+            raise HTTPException(status_code=404, detail="Gateway not found")
+
+        logger.info("Gateway deleted: id=%s", gateway_id)
+        return {"success": True, "message": f"Gateway {gateway_id} deleted"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Error deleting gateway")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@gateway_router.get("/gateways/{gateway_id}/metrics")
+async def get_gateway_metrics(gateway_id: str, req: Request):
+    """Get cache entries and query stats for a gateway. Requires authentication."""
+    await require_role(req, "use")
+    try:
+        gw = await _db.db_service.get_gateway(gateway_id)
+        if not gw:
+            raise HTTPException(status_code=404, detail="Gateway not found")
+
+        stats = await _db.db_service.get_gateway_stats(gateway_id)
+        cache_entries = stats.get("cache_count", 0)
+        total_queries = stats.get("query_count_7d", 0)
+        cache_hits = stats.get("cache_hits_7d", 0)
+        hit_rate = (cache_hits / total_queries) if total_queries > 0 else 0.0
+        return {
+            "gateway_id": gateway_id,
+            "cache_entries": cache_entries,
+            "cache_count": cache_entries,  # legacy alias
+            "total_queries": total_queries,
+            "query_count_7d": total_queries,
+            "cache_hits": cache_hits,
+            "cache_hit_rate": hit_rate,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Error getting gateway metrics")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# --- Gateway-scoped cache & logs ---
+
+@gateway_router.get("/gateways/{gateway_id}/cache")
+async def get_gateway_cache(gateway_id: str, req: Request):
+    """List all cached entries for a specific gateway. Manage or above."""
+    await require_role(req, "manage")
+    try:
+        gw = await _db.db_service.get_gateway(gateway_id)
+        if not gw:
+            raise HTTPException(status_code=404, detail="Gateway not found")
+        entries = await _db.db_service.get_all_cached_queries(identity=None, runtime_settings=None, gateway_id=gateway_id)
+        return entries
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Error listing gateway cache")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+
+class CacheDeleteRequest(BaseModel):
+    entry_ids: list[int]
+
+
+@gateway_router.post("/gateways/{gateway_id}/cache/delete")
+async def delete_gateway_cache_entries(gateway_id: str, body: CacheDeleteRequest, req: Request):
+    """Delete selected cache entries for a specific gateway. Manage or above."""
+    await require_role(req, "manage")
+    try:
+        gw = await _db.db_service.get_gateway(gateway_id)
+        if not gw:
+            raise HTTPException(status_code=404, detail="Gateway not found")
+        if not body.entry_ids:
+            return {"deleted": 0, "gateway_id": gateway_id}
+        count = await _db.db_service.delete_cache_entries(body.entry_ids, gateway_id)
+        logger.info("Deleted %d cache entries from gateway %s", count, gateway_id)
+        return {"deleted": count, "gateway_id": gateway_id}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Error deleting cache entries")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@gateway_router.get("/gateways/{gateway_id}/logs")
+async def get_gateway_logs(gateway_id: str, req: Request, limit: int = 50):
+    """List query logs for a specific gateway. Manage or above."""
+    await require_role(req, "manage")
+    try:
+        gw = await _db.db_service.get_gateway(gateway_id)
+        if not gw:
+            raise HTTPException(status_code=404, detail="Gateway not found")
+        logs = await _db.db_service.get_query_logs(identity=None, limit=limit, gateway_id=gateway_id)
+        return logs
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Error listing gateway logs")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# --- Workspace discovery endpoints ---
+
+@gateway_router.get("/workspace/genie-spaces")
+async def list_genie_spaces(req: Request):
+    """List available Genie Spaces from the workspace (paginated).
+    Uses the user's token when passthrough is enabled, SP token otherwise.
+    """
+    try:
+        token = resolve_user_token_optional(req)
+        if not token:
+            logger.warning("No token available for Genie Spaces discovery — enable user token passthrough or configure a service principal")
+            return {"spaces": [], "warning": "No authentication token available. Configure token passthrough or a service principal."}
+        host = _get_host()
+        headers = {"Authorization": f"Bearer {token}"}
+
+        all_spaces: list = []
+        page_token: Optional[str] = None
+        for _ in range(50):  # hard cap to avoid infinite loops
+            url = f"{host}/api/2.0/genie/spaces"
+            params = {"page_token": page_token} if page_token else None
+            resp = await _discovery_client.get(url, headers=headers, params=params)
+            if resp.status_code != 200:
+                logger.warning("Genie spaces API returned %d: %s", resp.status_code, resp.text[:200])
+                raise HTTPException(status_code=resp.status_code, detail=f"Databricks API error: {resp.text}")
+            payload = resp.json()
+            all_spaces.extend(payload.get("spaces", []))
+            page_token = payload.get("next_page_token")
+            if not page_token:
+                break
+        return {"spaces": all_spaces}
+    except HTTPException:
+        raise
+    except httpx.HTTPError as e:
+        logger.exception("Failed to reach Genie Spaces API")
+        raise HTTPException(status_code=502, detail=f"Failed to reach Databricks API: {e}")
+    except Exception as e:
+        logger.exception("Error listing Genie spaces")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@gateway_router.get("/workspace/warehouses")
+async def list_warehouses(req: Request):
+    """List available SQL warehouses from the workspace.
+    Uses the user's token when passthrough is enabled, SP token otherwise.
+    """
+    try:
+        token = resolve_user_token_optional(req)
+        if not token:
+            logger.warning("No token available for warehouse discovery — enable user token passthrough or configure a service principal")
+            return {"warehouses": [], "warning": "No authentication token available. Configure token passthrough or a service principal."}
+        host = _get_host()
+
+        url = f"{host}/api/2.0/sql/warehouses"
+        resp = await _discovery_client.get(url, headers={"Authorization": f"Bearer {token}"})
+        if resp.status_code != 200:
+            logger.warning("Warehouses API returned %d: %s", resp.status_code, resp.text[:200])
+            raise HTTPException(status_code=resp.status_code, detail=f"Databricks API error: {resp.text}")
+        return resp.json()
+    except HTTPException:
+        raise
+    except httpx.HTTPError as e:
+        logger.exception("Failed to reach Warehouses API")
+        raise HTTPException(status_code=502, detail=f"Failed to reach Databricks API: {e}")
+    except Exception as e:
+        logger.exception("Error listing warehouses")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@gateway_router.get("/workspace/serving-endpoints")
+async def list_serving_endpoints(req: Request):
+    """List available serving endpoints from the workspace.
+    Uses the user's token when passthrough is enabled, SP token otherwise.
+    """
+    try:
+        token = resolve_user_token_optional(req)
+        if not token:
+            logger.warning("No token available for serving endpoints discovery — enable user token passthrough or configure a service principal")
+            return {"endpoints": [], "warning": "No authentication token available. Configure token passthrough or a service principal."}
+        host = _get_host()
+
+        url = f"{host}/api/2.0/serving-endpoints"
+        resp = await _discovery_client.get(url, headers={"Authorization": f"Bearer {token}"})
+        if resp.status_code != 200:
+            logger.warning("Serving endpoints API returned %d: %s", resp.status_code, resp.text[:200])
+            raise HTTPException(status_code=resp.status_code, detail=f"Databricks API error: {resp.text}")
+        data = resp.json()
+        endpoints = data.get("endpoints", [])
+        return {
+            "endpoints": [
+                {
+                    "name": ep.get("name", ""),
+                    "task": ep.get("task", ""),
+                    "state": ep.get("state", {}).get("ready", "UNKNOWN"),
+                }
+                for ep in endpoints
+                if ep.get("state", {}).get("ready") == "READY"
+            ]
+        }
+    except HTTPException:
+        raise
+    except httpx.HTTPError as e:
+        logger.exception("Failed to reach Serving Endpoints API")
+        raise HTTPException(status_code=502, detail=f"Failed to reach Databricks API: {e}")
+    except Exception as e:
+        logger.exception("Error listing serving endpoints")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@gateway_router.get("/workspace/search")
+async def search_workspace_principals(req: Request, q: str = ""):
+    """Search workspace users via SCIM filtered query. Fast — single SCIM call.
+    Returns up to 10 matching users for the given query string."""
+    await require_role(req, "manage")
+    if not q or len(q) < 2:
+        return {"users": []}
+    try:
+        from app.services.rbac import _get_sp_token
+        token = _get_sp_token() or resolve_user_token_optional(req)
+        if not token:
+            return {"users": []}
+        host = _get_host()
+        safe_q = q.replace('"', '')
+        scim_filter = f'displayName co "{safe_q}" or userName co "{safe_q}"'
+        resp = await _discovery_client.get(
+            f"{host}/api/2.0/preview/scim/v2/Users",
+            headers={"Authorization": f"Bearer {token}"},
+            params={"filter": scim_filter, "count": 10, "attributes": "userName,displayName,active"},
+        )
+        if resp.status_code != 200:
+            logger.warning("SCIM search returned %d: %s", resp.status_code, resp.text[:200])
+            return {"users": []}
+        resources = resp.json().get("Resources", [])
+        return {
+            "users": [
+                {"email": u.get("userName", ""), "displayName": u.get("displayName", u.get("userName", "")), "active": u.get("active", True)}
+                for u in resources if u.get("userName") and u.get("active", True)
+            ]
+        }
+    except Exception as e:
+        logger.warning("SCIM search error: %s", e)
+        return {"users": []}
+
+
+@gateway_router.get("/workspace/groups")
+async def list_workspace_groups_endpoint(req: Request):
+    """List workspace groups via SCIM for group role assignment autocomplete."""
+    await require_role(req, "manage")
+    from app.services.rbac import list_workspace_groups
+    host = _get_host()
+    groups = await list_workspace_groups(host)
+    return {"groups": groups}
+
+
+@gateway_router.post("/settings/test-connection")
+async def test_lakebase_connection(req: Request):
+    """Test Lakebase connection and check if required tables exist. Owner only."""
+    await require_role(req, "owner")
+    results = {
+        "connected": False,
+        "cache_table_exists": False,
+        "query_log_table_exists": False,
+        "gateway_table_exists": False,
+        "error": None,
+    }
+    try:
+        # db_service is DatabaseService which wraps _storage_backend (DynamicStorageService)
+        import app.services.database as _db_module
+        dynamic = _db_module._storage_backend
+        if dynamic is None:
+            results["error"] = "Storage backend not initialized."
+            return results
+
+        backend = dynamic.default_backend
+        if not hasattr(backend, 'pool') or backend.pool is None:
+            results["error"] = "Lakebase pool not available. Check instance name and credentials."
+            return results
+
+        # If pool is closed, try to reinitialize
+        if backend.pool._closed:
+            try:
+                await backend.initialize()
+            except Exception as e:
+                results["error"] = f"Reconnect failed: {e}"
+                return results
+
+        async with backend.pool.acquire() as conn:
+            results["connected"] = True
+            for attr, key in [
+                ("table_name", "cache_table_exists"),
+                ("query_log_table_name", "query_log_table_exists"),
+                ("gateway_table_name", "gateway_table_exists"),
+            ]:
+                table = getattr(backend, attr, None)
+                if not table:
+                    continue
+                parts = table.split(".")
+                tbl = parts[-1]
+                schema = parts[-2] if len(parts) >= 2 else "public"
+                row = await conn.fetchrow(
+                    "SELECT 1 FROM information_schema.tables WHERE table_schema=$1 AND table_name=$2",
+                    schema, tbl
+                )
+                results[key] = row is not None
+
+        return results
+    except Exception as e:
+        results["error"] = str(e)
+        return results
+
+
+# --- Settings endpoints (reuse existing config_store) ---
+
+@gateway_router.get("/settings")
+async def get_settings_endpoint(req: Request):
+    """Return current server configuration. Owner only."""
+    await require_role(req, "owner")
+    overrides = get_overrides()
+    ttl_hours = get_effective_setting("cache_ttl_hours") or 0
+    ttl_seconds = int(ttl_hours * 3600)
+    return {
+        "app_version": APP_VERSION,
+        "genie_space_id": get_effective_setting("genie_space_id"),
+        "genie_spaces": get_effective_setting("genie_spaces") or [],
+        "sql_warehouse_id": get_effective_setting("sql_warehouse_id"),
+        "similarity_threshold": get_effective_setting("similarity_threshold"),
+        "max_queries_per_minute": get_effective_setting("max_queries_per_minute"),
+        "cache_ttl_seconds": ttl_seconds,
+        "shared_cache": overrides.get("shared_cache", True),
+        "embedding_provider": get_effective_setting("embedding_provider"),
+        "databricks_embedding_endpoint": get_effective_setting("databricks_embedding_endpoint"),
+        "storage_backend": get_effective_setting("storage_backend"),
+        "lakebase_instance_name": settings.lakebase_instance or overrides.get("lakebase_instance_name"),
+        "lakebase_catalog": settings.lakebase_catalog or overrides.get("lakebase_catalog"),
+        "lakebase_schema": settings.lakebase_schema or overrides.get("lakebase_schema"),
+        "cache_table_name": settings.pgvector_table_name or overrides.get("cache_table_name"),
+        "query_log_table_name": overrides.get("query_log_table_name", "query_logs"),
+        "lakebase_service_token_set": bool(get_effective_setting("lakebase_service_token") or os.getenv("DATABRICKS_CLIENT_ID")),
+        "lakebase_token_source": "override" if get_effective_setting("lakebase_service_token") else ("auto" if os.getenv("DATABRICKS_CLIENT_ID") else "none"),
+        "question_normalization_enabled": overrides.get("question_normalization_enabled", True),
+        "normalization_model": overrides.get("normalization_model", ""),
+        "cache_validation_enabled": overrides.get("cache_validation_enabled", True),
+        "validation_model": overrides.get("validation_model", ""),
+        "intent_split_enabled": overrides.get("intent_split_enabled", True),
+        "intent_split_model": overrides.get("intent_split_model", ""),
+    }
+
+
+class SettingsUpdateRequest(GatewayUpdateRequest):
+    """Settings update - reuses gateway fields plus additional config fields."""
+    lakebase_service_token: Optional[str] = None
+    genie_space_id: Optional[str] = None
+    genie_spaces: Optional[list] = None
+    sql_warehouse_id: Optional[str] = None
+    cache_ttl_seconds: Optional[int] = None
+    storage_backend: Optional[str] = None
+    lakebase_instance_name: Optional[str] = None
+    lakebase_catalog: Optional[str] = None
+    lakebase_schema: Optional[str] = None
+    cache_table_name: Optional[str] = None
+    query_log_table_name: Optional[str] = None
+
+
+@gateway_router.put("/settings")
+async def update_settings_endpoint(body: SettingsUpdateRequest, req: Request):
+    """Update server configuration. Owner only."""
+    await require_role(req, "owner")
+    batch = {}
+    updated = {}
+    for field, value in body.model_dump(exclude_none=True).items():
+        if field == "cache_ttl_seconds":
+            batch["cache_ttl_hours"] = value / 3600
+            updated["cache_ttl_seconds"] = value
+        elif field == "lakebase_service_token":
+            batch[field] = value
+            updated[field] = "***"
+        else:
+            batch[field] = value
+            updated[field] = value
+
+    if not updated:
+        raise HTTPException(status_code=400, detail="No fields to update.")
+
+    user_email = req.headers.get("X-Forwarded-Email")
+    await update_overrides(batch, updated_by=user_email)
+    logger.info("Settings updated via gateway API: %s", updated)
+    return {"updated": updated, "message": "Settings updated successfully"}
+
+
+# Allowlist of keys accepted by DELETE /settings/{key}. Derived from the same
+# Pydantic model that governs PUT /settings so the two stay in sync. `cache_ttl_seconds`
+# is the PUT alias; the persisted key is `cache_ttl_hours`, so we swap it.
+_DELETABLE_SETTING_KEYS = (
+    set(SettingsUpdateRequest.model_fields.keys()) - {"cache_ttl_seconds"}
+) | {"cache_ttl_hours"}
+
+# Boot-time guard: a future refactor that aliases or drops one of these keys
+# would silently shrink the allowlist and make the corresponding DELETE return
+# 400. Failing at import time surfaces the drift immediately instead of on the
+# first DELETE call from the UI.
+_EXPECTED_DELETABLE_KEYS = {
+    "similarity_threshold", "max_queries_per_minute", "cache_ttl_hours",
+    "question_normalization_enabled", "cache_validation_enabled",
+    "intent_split_enabled", "normalization_model", "validation_model",
+    "intent_split_model", "embedding_provider", "databricks_embedding_endpoint",
+    "shared_cache", "lakebase_service_token",
+}
+_missing = _EXPECTED_DELETABLE_KEYS - _DELETABLE_SETTING_KEYS
+assert not _missing, (
+    f"SettingsUpdateRequest / _DELETABLE_SETTING_KEYS drift: "
+    f"missing expected keys {_missing}. Update one or the other."
+)
+
+
+@gateway_router.delete("/settings/{key}")
+async def delete_setting_endpoint(key: str, req: Request):
+    """Remove a single global setting override. Owner only."""
+    await require_role(req, "owner")
+    if key not in _DELETABLE_SETTING_KEYS:
+        raise HTTPException(status_code=400, detail=f"Unknown setting key: {key}")
+    from app.api.config_store import delete_override
+    try:
+        deleted = await delete_override(key)
+    except Exception as e:
+        logger.exception("Error deleting global setting %s", key)
+        raise HTTPException(status_code=500, detail=str(e))
+    if deleted:
+        logger.info("Global setting deleted: %s", key)
+    else:
+        logger.info("Global setting delete requested but not found: %s", key)
+    return {"key": key, "deleted": deleted}

@@ -1,0 +1,51 @@
+# Declarative Automation Bundle (Databricks Asset Bundles)
+# Deploy: npm run bundle:deploy  (or `databricks bundle deploy -t demo --auto-approve`)
+# UI: Dash (Python) mounted at /dash/ — no npm build.
+# Start app:  databricks bundle run genie_gateway -t demo
+#
+# Override Lakebase DB path per workspace before first deploy:
+#   databricks bundle deploy -t demo --var lakebase_database="projects/foo/branches/production/databases/db-xxxx"
+
+bundle:
+  name: genie_space_lakebase_cache
+
+include:
+  - resources/*.yml
+
+variables:
+  app_name:
+    default: genie-cache-demo
+  lakebase_branch:
+    default: projects/cdk-service-dev/branches/production
+  # Full database resource path from Lakebase Postgres (Catalog → Lakebase → database id).
+  # Required for the app Postgres binding; retrieve from APIs or Catalog Explorer after project exists.
+  lakebase_database:
+    default: projects/cdk-service-dev/branches/production/databases/db-wtsv-txjr527l0z
+  lakebase_catalog:
+    default: default
+  lakebase_schema:
+    default: public
+  genie_space_id:
+    default: 01f10c44f12f1e4eb2a6d61a51aae7c8
+  genie_space_name:
+    default: CDK Lending Analytics
+
+sync:
+  paths:
+    - ./
+
+targets:
+  demo:
+    default: true
+    mode: production
+    workspace:
+      profile: group-demo
+      root_path: /Workspace/Users/${workspace.current_user.userName}/.bundle/${bundle.name}/${bundle.target}
+    variables:
+      app_name: genie-cache-demo
+      lakebase_branch: projects/cdk-service-dev/branches/production
+      lakebase_database: projects/cdk-service-dev/branches/production/databases/db-wtsv-txjr527l0z
+      lakebase_catalog: default
+      lakebase_schema: public
+      genie_space_id: 01f10c44f12f1e4eb2a6d61a51aae7c8
+      genie_space_name: CDK Lending Analytics

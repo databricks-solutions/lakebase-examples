@@ -1,0 +1,33 @@
+# Databricks Apps runtime configuration (Databricks Asset Bundles also set
+# user_api_scopes, Postgres + Genie resources, and supplemental env via
+# resources/genie_gateway.app.yml).
+# Reference: https://docs.databricks.com/aws/en/dev-tools/databricks-apps/
+
+name: genie-cache-demo
+display_name: "Genie API with Cache & Queue"
+description: "Intelligent query caching and rate limiting for Databricks Genie API"
+
+# Root app.py binds DATABRICKS_APP_PORT; see also uvicorn CLI examples in docs.
+command:
+  - "python"
+  - "app.py"
+
+# Compute hint (bundles declare compute_size on the apps resource — keep aligned).
+compute:
+  size: medium
+
+# Environment variables
+# DATABRICKS_HOST and DATABRICKS_TOKEN are automatically provided by Databricks Apps
+env:
+  - name: STORAGE_BACKEND
+    value: pgvector
+  - name: LAKEBASE_INSTANCE
+    value: projects/cdk-service-dev/branches/production
+  - name: POSTGRES_DATABASE
+    value: databricks_postgres
+  - name: LAKEBASE_CATALOG
+    value: default
+  - name: LAKEBASE_SCHEMA
+    value: public
+
+# Static files served by FastAPI (not needed here)
