@@ -1,0 +1,45 @@
+# Paths in this file are relative to bundle root (`..` exits resources/ folder).
+resources:
+  apps:
+    genie_gateway:
+      name: ${var.app_name}
+      description: "Genie Gateway — cache, rate limits, and proxy for Genie API"
+      # Bundle sync uploads repo root → workspace; app resolves app.yml/command from this tree.
+      source_code_path: ../
+      compute_size: MEDIUM
+      user_api_scopes:
+        - sql
+        - dashboards.genie
+        - serving.serving-endpoints
+
+      resources:
+        - name: postgres
+          postgres:
+            branch: ${var.lakebase_branch}
+            database: ${var.lakebase_database}
+            permission: CAN_CONNECT_AND_CREATE
+        - name: genie-space
+          genie_space:
+            space_id: ${var.genie_space_id}
+            name: ${var.genie_space_name}
+            permission: CAN_RUN
+
+      # command + base env live in app.yml (synced from repo root).
+      config:
+        env:
+          - name: STORAGE_BACKEND
+            value: pgvector
+          - name: LAKEBASE_INSTANCE
+            value: ${var.lakebase_branch}
+          - name: POSTGRES_DATABASE
+            value: databricks_postgres
+          - name: LAKEBASE_CATALOG
+            value: ${var.lakebase_catalog}
+          - name: LAKEBASE_SCHEMA
+            value: ${var.lakebase_schema}
+          # Injected when the Postgres + Genie resources above are deployed with the app
+          - name: GENIE_SPACE_ID
+            value_from: genie-space
+          # Use app OAuth principal for Genie REST (matches Workspace app → Genie space binding).
+          - name: GENIE_FORCE_APP_SERVICE_PRINCIPAL
+            value: "true"

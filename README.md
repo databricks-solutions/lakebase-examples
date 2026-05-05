@@ -5,6 +5,16 @@ Examples and guides to accelerate your Lakebase projects:
 - Official Lakebase announcment blog: https://www.databricks.com/product/lakebase
 - Official Documentation: https://docs.databricks.com/aws/en/oltp/
 
+## Examples in this repository
+
+| Folder | Description |
+|--------|--------------|
+| [`ai_memory/`](ai_memory/) | AI memory patterns |
+| [`apps/`](apps/) | Sample applications |
+| [`feature_store/`](feature_store/) | Feature store integration |
+| [`reverse_etl/`](reverse_etl/) | Reverse ETL examples |
+| [`genie_caching/`](genie_caching/) | Genie conversational API proxy with Lakebase (pgvector) semantic query cache; deploy via Databricks Asset Bundle. See [`genie_caching/README.md`](genie_caching/README.md). |
+
 ## Contributing
 
 To Contribute:
